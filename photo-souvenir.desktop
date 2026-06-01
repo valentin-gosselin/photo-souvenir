@@ -9,5 +9,5 @@ Icon=photo-souvenir
 Terminal=false
 Categories=Graphics;Photography;Qt;
 StartupNotify=true
-StartupWMClass=Photo Souvenir
+StartupWMClass=photo-souvenir
 Keywords=photo;raw;arw;darktable;lut;film;portra;etalonnage;batch;souvenir;

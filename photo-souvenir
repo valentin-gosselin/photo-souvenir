@@ -52,6 +52,15 @@ def find_bundled_lut(filename):
     return None
 
 
+def _icon_path():
+    """Chemin de l'icone (installee ou bundlee a cote du script)."""
+    for p in [Path.home() / '.local/share/icons/hicolor/scalable/apps/photo-souvenir.svg',
+              Path(__file__).resolve().parent / 'photo-souvenir.svg' if __file__ else None]:
+        if p and p.is_file():
+            return str(p)
+    return None
+
+
 # Presets de look. Chaque entry pointe vers un .cube bundle (Film LUTs MIT, YahiaAngelo).
 STYLE_PRESETS = {
     'portrait': {'cube': 'portrait-kodak-portra.cube'},
@@ -477,7 +486,7 @@ def run_cli(args):
 def run_ui():
     try:
         from PySide6.QtCore import Qt, QThread, Signal
-        from PySide6.QtGui import QFont
+        from PySide6.QtGui import QFont, QIcon
         from PySide6.QtWidgets import (
             QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
             QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
@@ -793,7 +802,17 @@ def run_ui():
                                     f"Terminé : {ok} photos traitées, {ko} échecs.")
 
     app = QApplication(sys.argv)
+    # Association au .desktop pour que Wayland affiche la bonne icone (barre des
+    # taches + fenetre) au lieu de l'icone generique.
+    app.setApplicationName("Photo Souvenir")
+    app.setApplicationDisplayName("Photo Souvenir")
+    app.setDesktopFileName("photo-souvenir")
+    icon_path = _icon_path()
+    if icon_path:
+        app.setWindowIcon(QIcon(icon_path))
     win = MainWindow()
+    if icon_path:
+        win.setWindowIcon(QIcon(icon_path))
     win.show()
     return app.exec()
 

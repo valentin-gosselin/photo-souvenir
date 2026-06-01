@@ -2,22 +2,31 @@
 <svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#d98a3d"/>
-      <stop offset="1" stop-color="#7a3b1f"/>
+      <stop offset="0" stop-color="#3a2c4f"/>
+      <stop offset="1" stop-color="#1c1322"/>
     </linearGradient>
+    <radialGradient id="lens" cx="0.42" cy="0.38" r="0.7">
+      <stop offset="0" stop-color="#ffd9a0"/>
+      <stop offset="0.45" stop-color="#e8915a"/>
+      <stop offset="1" stop-color="#7a3b1f"/>
+    </radialGradient>
   </defs>
-  <rect x="8" y="8" width="112" height="112" rx="24" fill="url(#bg)"/>
-  <!-- diaphragme d'objectif -->
-  <g transform="translate(64,64)" fill="none" stroke="#fff" stroke-width="5" stroke-linejoin="round">
-    <circle r="34"/>
+  <rect x="6" y="6" width="116" height="116" rx="26" fill="url(#bg)"/>
+  <!-- corps d'objectif -->
+  <circle cx="64" cy="64" r="42" fill="#241a30"/>
+  <circle cx="64" cy="64" r="42" fill="none" stroke="#52415f" stroke-width="2"/>
+  <!-- verre -->
+  <circle cx="64" cy="64" r="33" fill="url(#lens)"/>
+  <!-- pétales du diaphragme -->
+  <g fill="#241a30" opacity="0.30">
+    <path d="M64 31 L84 43 L84 49 Z"/>
+    <path d="M93 49 L93 73 L88 64 Z"/>
+    <path d="M84 85 L64 97 L73 86 Z"/>
+    <path d="M44 85 L40 64 L55 86 Z"/>
+    <path d="M35 49 L55 42 L40 55 Z"/>
   </g>
-  <g transform="translate(64,64)" fill="#fff" opacity="0.92">
-    <path d="M0,-30 L26,-15 L26,4 Z"/>
-    <path d="M26,-15 L26,15 L9,28 Z" opacity="0.8"/>
-    <path d="M26,15 L0,30 L-9,13 Z"/>
-    <path d="M0,30 L-26,15 L-9,2 Z" opacity="0.8"/>
-    <path d="M-26,15 L-26,-15 L-9,-2 Z"/>
-    <path d="M-26,-15 L0,-30 L9,-13 Z" opacity="0.8"/>
-  </g>
-  <circle cx="64" cy="64" r="9" fill="#7a3b1f"/>
+  <!-- pupille + reflets -->
+  <circle cx="64" cy="64" r="13" fill="#2a1d18"/>
+  <circle cx="56" cy="55" r="6" fill="#fff" opacity="0.85"/>
+  <circle cx="73" cy="74" r="3" fill="#ffe9c8" opacity="0.7"/>
 </svg>
