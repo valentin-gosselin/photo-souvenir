@@ -7,10 +7,15 @@ Le cœur, c'est le **mode adaptatif** : chaque photo est analysée et le LUT / c
 ## Pipeline (par photo)
 
 1. **Développement RAW** via `darktable-cli` → TIFF 16-bit, orientation redressée
-2. **Exposition adaptative** : la luminosité est ramenée vers une cible mesurée (rattrape les sombres, maîtrise les surexposées)
-3. **Contraste en courbe S** + noirs profonds
-4. **LUT film** (Kodak Portra par défaut) dosé selon la clarté de l'image
-5. **Métadonnées d'origine** recopiées (date/boîtier), orientation remise à normal
+2. **Détection de grain + débruitage adaptatif** (optionnel) : mesure le bruit réel de chaque photo (σ par tuiles) et débruite seulement celles qui dépassent un seuil — débruitage *chroma-focus* qui enlève les points colorés tout en gardant un grain de luminance argentique
+3. **Exposition adaptative** : la luminosité est ramenée vers une cible mesurée (rattrape les sombres, maîtrise les surexposées)
+4. **Contraste en courbe S** + noirs profonds
+5. **LUT film** (Kodak Portra par défaut) dosé selon la clarté de l'image
+6. **Métadonnées d'origine** recopiées (date/boîtier), orientation remise à normal
+
+### Détection de grain
+
+Le débruitage est **désactivé par défaut** (le grain donne souvent un rendu argentique voulu). En mode `auto`, chaque photo est notée par un σ de bruit mesuré en pleine résolution ; seules celles au-dessus du seuil sont débruitées. Repères de σ : ISO 200 ≈ 0.4, ISO 8000 ≈ 2.1, ISO 51200 ≈ 3.8. Le débruitage cible d'abord le bruit chroma (points colorés, le plus gênant) et préserve le grain de luminance.
 
 ## Prérequis
 
@@ -54,9 +59,12 @@ photo-souvenir "/dossier" --style cinema-kodak --contrast 4 --lut-strength 60
 
 # LUT custom, sans adaptatif, JPEG plus legers
 photo-souvenir "/dossier" /sortie --lut /chemin/look.cube --no-adaptive --quality 88
+
+# debruite seulement les photos tres bruitees (ISO eleve)
+photo-souvenir "/dossier" --denoise auto --noise-threshold 1.5
 ```
 
-Options principales : `--style` (portrait/cinema-kodak/cinema-fuji/vintage/chrome/bw/neutral/custom), `--lut`, `--no-adaptive`, `--target`, `--contrast`, `--lut-strength`, `--saturation`, `--quality`, `--max-size`, `--workers`.
+Options principales : `--style` (portrait/cinema-kodak/cinema-fuji/vintage/chrome/bw/neutral/custom), `--lut`, `--no-adaptive`, `--target`, `--contrast`, `--lut-strength`, `--saturation`, `--quality`, `--max-size`, `--denoise` (off/auto/always), `--noise-threshold`, `--workers`.
 
 ## LUTs
 

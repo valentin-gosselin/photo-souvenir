@@ -38,16 +38,21 @@ done
 [[ -z "$PYTHON" ]] && { err "Python 3 introuvable"; exit 1; }
 ok "Python: $PYTHON"
 
-# --- Install PySide6 ---
-bold "Installation de PySide6 (si manquant)"
+# --- Install dependances Python (PySide6 pour l'UI, numpy/Pillow pour la detection de bruit) ---
+bold "Installation des dependances Python"
+pip_install() {
+  "$PYTHON" -m pip install --quiet "$@" 2>/dev/null || "$PYTHON" -m pip install --quiet --user "$@"
+}
 if "$PYTHON" -c "import PySide6" 2>/dev/null; then
   ok "PySide6 deja installe"
 else
-  echo "  Installation via pip..."
-  if ! "$PYTHON" -m pip install --quiet PySide6 2>/dev/null; then
-    "$PYTHON" -m pip install --quiet --user PySide6
-  fi
-  ok "PySide6 installe"
+  echo "  Installation de PySide6..."; pip_install PySide6; ok "PySide6 installe"
+fi
+if "$PYTHON" -c "import numpy, PIL" 2>/dev/null; then
+  ok "numpy / Pillow deja installes"
+else
+  echo "  Installation de numpy + Pillow (detection de bruit)..."; pip_install numpy Pillow
+  ok "numpy / Pillow installes"
 fi
 
 # --- Install script ---
