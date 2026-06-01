@@ -455,7 +455,7 @@ def run_cli(args):
     if style not in ('neutral',) and not lut:
         print(f"Style '{style}': LUT introuvable, fallback neutre.", file=sys.stderr)
 
-    out_dir = args.output or str(folder / 'Retouche_Portra')
+    out_dir = args.output or str(folder / 'export')
     P = Params(target=args.target, contrast=args.contrast,
                lut_strength=args.lut_strength, saturation=args.saturation,
                adaptive=args.adaptive, quality=args.quality, max_size=args.max_size,
@@ -677,7 +677,7 @@ def run_ui():
 
             g.addWidget(QLabel("Sortie:"), 7, 2)
             self.out_edit = QLineEdit()
-            self.out_edit.setPlaceholderText("(sous-dossier Retouche_Portra)")
+            self.out_edit.setPlaceholderText("(sous-dossier export)")
             g.addWidget(self.out_edit, 7, 3)
 
             layout.addWidget(opts)
@@ -735,7 +735,7 @@ def run_ui():
 
         def _update_out_default(self, text):
             if text.strip():
-                self.out_edit.setPlaceholderText(str(Path(text.strip()) / 'Retouche_Portra'))
+                self.out_edit.setPlaceholderText(str(Path(text.strip()) / 'export'))
 
         def _gather(self):
             key = STYLE_LABELS[self.style_combo.currentIndex()][0]
@@ -767,7 +767,7 @@ def run_ui():
             if key not in ('neutral',) and not lut:
                 QMessageBox.warning(self, "Photo Souvenir", "LUT introuvable pour ce style.")
                 return
-            out_dir = self.out_edit.text().strip() or str(Path(folder) / 'Retouche_Portra')
+            out_dir = self.out_edit.text().strip() or str(Path(folder) / 'export')
             self.log.clear()
             self.log.append(f"Style: {key}" + (f" ({Path(lut).name})" if lut else ""))
             self.progress.setVisible(True)
@@ -802,7 +802,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Developpe et etalonne un lot de photos RAW avec un look film.")
     parser.add_argument('folder', nargs='?', help="Dossier source. Si omis, ouvre l'UI.")
-    parser.add_argument('output', nargs='?', help="Dossier de sortie (defaut: <source>/Retouche_Portra).")
+    parser.add_argument('output', nargs='?', help="Dossier de sortie (defaut: <source>/export).")
     parser.add_argument('--style', default='portrait',
                         choices=[k for k, _ in STYLE_LABELS],
                         help="Look film applique (defaut: portrait/Portra).")

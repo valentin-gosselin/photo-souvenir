@@ -46,12 +46,12 @@ Lance `photo-souvenir` sans argument, ou cherche **Photo Souvenir** dans le menu
 - Sélectionne le dossier source contenant tes RAW
 - Choisis le style (LUT), garde le mode adaptatif coché
 - Ajuste éventuellement force du LUT / contraste / cible d'expo / saturation
-- Clique **Lancer** — les JPEG sortent dans `Retouche_Portra/`
+- Clique **Lancer** — les JPEG sortent dans `export/`
 
 ### CLI
 
 ```bash
-# look Portra adaptatif (defaut), sortie dans <dossier>/Retouche_Portra
+# look Portra adaptatif (defaut), sortie dans <dossier>/export
 photo-souvenir "/chemin/vers/dossier"
 
 # autre style, contraste plus doux, LUT plus discret
