@@ -1,0 +1,637 @@
+#!/usr/bin/env python3
+"""
+photo-souvenir - Developpe et etalonne un lot de photos RAW (Sony ARW & co)
+                 avec un look film, en mode automatique adaptatif.
+
+Pipeline par photo :
+  1. developpement RAW (darktable-cli) -> TIFF 16-bit, orientation redressee
+  2. exposition adaptative (ramene la luminosite vers une cible mesuree)
+  3. contraste en courbe S + noirs profonds
+  4. LUT film (Kodak Portra par defaut) dose selon la clarte de l'image
+  5. metadonnees d'origine recopiees (date/boitier), orientation remise a normal
+
+Le mode adaptatif attenue automatiquement LUT/contraste/saturation sur les
+photos deja claires (ensoleillees) pour eviter la sursaturation, et applique
+le plein effet sur les photos sombres ou plates.
+
+Usage:
+  photo-souvenir                          # ouvre l'UI PySide6
+  photo-souvenir <dossier> [sortie]       # mode CLI
+"""
+
+import argparse
+import datetime
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+RAW_EXTS = {'.arw', '.cr2', '.cr3', '.nef', '.raf', '.dng', '.orf', '.rw2', '.pef', '.srw'}
+
+# Repertoires ou chercher les LUTs bundlees (par ordre de priorite)
+LUT_DIRS = [
+    Path.home() / '.local' / 'share' / 'photo-souvenir' / 'luts',
+    Path(__file__).resolve().parent / 'luts' if __file__ else None,
+]
+LUT_DIRS = [p for p in LUT_DIRS if p]
+
+
+def find_bundled_lut(filename):
+    for d in LUT_DIRS:
+        p = d / filename
+        if p.is_file():
+            return str(p)
+    return None
+
+
+# Presets de look. Chaque entry pointe vers un .cube bundle (Film LUTs MIT, YahiaAngelo).
+STYLE_PRESETS = {
+    'portrait': {'cube': 'portrait-kodak-portra.cube'},
+    'cinema-kodak': {'cube': 'cinema-kodak-2383.cube'},
+    'cinema-fuji': {'cube': 'cinema-fuji-3510.cube'},
+    'vintage': {'cube': 'vintage-fuji-superia.cube'},
+    'chrome': {'cube': 'fuji-classic-chrome.cube'},
+    'bw': {'cube': 'bw-kodak-trix.cube'},
+    'neutral': None,
+    'custom': None,
+}
+
+STYLE_LABELS = [
+    ('portrait', 'Portrait Portra'),
+    ('cinema-kodak', 'Cinema Kodak 2383'),
+    ('cinema-fuji', 'Cinema Fuji 3510'),
+    ('vintage', 'Vintage Superia'),
+    ('chrome', 'Fuji Classic Chrome'),
+    ('bw', 'Noir & Blanc Tri-X'),
+    ('neutral', 'Neutre (sans LUT)'),
+    ('custom', 'Custom LUT...'),
+]
+
+
+def detect_folder_lut(folder):
+    """Cherche un .cube dans le dossier source. Prefere look.cube."""
+    folder = Path(folder)
+    cubes = sorted(folder.glob('*.cube'))
+    if not cubes:
+        return None
+    preferred = next((p for p in cubes if p.stem.lower() == 'look'), None)
+    return str(preferred or cubes[0])
+
+
+def resolve_style_lut(preset_name, custom_lut_path):
+    """Renvoie le chemin absolu vers un .cube a appliquer, ou None."""
+    if preset_name == 'custom':
+        return custom_lut_path if custom_lut_path else None
+    preset = STYLE_PRESETS.get(preset_name)
+    if not preset or 'cube' not in preset:
+        return None
+    return find_bundled_lut(preset['cube'])
+
+
+def _ffmpeg_lut_path(lut):
+    """Echappe les chars speciaux ffmpeg dans un chemin de .cube."""
+    return lut.replace('\\', '\\\\').replace(':', '\\:').replace("'", "\\'")
+
+
+# --- Detection des outils ---
+
+def _which(name):
+    return shutil.which(name)
+
+
+def detect_tools():
+    """Renvoie un dict outil->chemin (ou None). magick OU convert accepte."""
+    tools = {
+        'darktable-cli': _which('darktable-cli'),
+        'ffmpeg': _which('ffmpeg'),
+        'exiftool': _which('exiftool'),
+    }
+    tools['magick'] = _which('magick') or _which('convert')
+    return tools
+
+
+def missing_tools(tools):
+    req = ['darktable-cli', 'ffmpeg', 'magick']
+    return [t for t in req if not tools.get(t)]
+
+
+# --- Parametres d'etalonnage ---
+
+class Params:
+    """Reglages d'etalonnage exposes a l'UI/CLI."""
+    def __init__(self, target=0.38, contrast=6.0, lut_strength=78,
+                 saturation=100, adaptive=True, quality=92, max_size=0):
+        self.target = target          # cible d'exposition (luminance moyenne 0..1)
+        self.contrast = contrast      # force courbe S (sigmoidal) sur sombres/moyennes
+        self.lut_strength = lut_strength  # % du LUT applique (sombres/moyennes)
+        self.saturation = saturation  # saturation finale (modulate, sombres/moyennes)
+        self.adaptive = adaptive      # attenue sur les photos claires
+        self.quality = quality        # qualite JPEG
+        self.max_size = max_size      # cote max en px (0 = pleine resolution)
+
+
+def compute_params(mean, P):
+    """Calcule les parametres effectifs d'une photo selon sa luminosite moyenne.
+
+    En mode adaptatif, k va de 0 (image sombre/moyenne) a 1 (image claire) et
+    attenue contraste/LUT/saturation pour eviter la sursaturation des photos
+    ensoleillees. Renvoie (gamma, sigmoid_strength, lut_pct, saturation).
+    """
+    mean = max(0.001, min(0.999, mean))
+    if P.adaptive:
+        min_g = 0.82  # limite l'assombrissement des photos claires
+        k = (mean - 0.25) / 0.30
+        k = max(0.0, min(1.0, k))
+    else:
+        min_g = 0.45
+        k = 0.0
+    g = math.log(mean) / math.log(P.target)
+    g = max(min_g, min(2.0, g))
+    sig = P.contrast * (1.0 - 0.5 * k)        # jusqu'a -50% sur les claires
+    lut_pct = int(round(P.lut_strength - 18 * k))   # jusqu'a -18 pts
+    lut_pct = max(0, min(100, lut_pct))
+    sat = int(round(P.saturation - 10 * k))   # jusqu'a -10
+    return g, sig, lut_pct, sat
+
+
+# --- Pipeline de traitement ---
+
+def _run(cmd):
+    return subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode
+
+
+def develop_raw(tools, raw, tif, configdir):
+    """RAW -> TIFF 16-bit via darktable-cli (orientation appliquee)."""
+    cmd = [tools['darktable-cli'], str(raw), str(tif),
+           '--hq', 'true', '--core', '--library', ':memory:',
+           '--configdir', str(configdir)]
+    _run(cmd)
+    return Path(tif).is_file()
+
+
+def measure_mean(tools, tif):
+    """Luminance moyenne 0..1 (sur une version reduite, rapide)."""
+    out = subprocess.run(
+        [tools['magick'], str(tif), '-resize', '300x',
+         '-colorspace', 'Gray', '-format', '%[fx:mean]', 'info:'],
+        capture_output=True, text=True)
+    try:
+        return float(out.stdout.strip())
+    except ValueError:
+        return 0.4
+
+
+def grade(tools, tif, out_jpg, lut, P, workdir):
+    """Applique exposition + contraste + LUT dose + saturation -> JPEG."""
+    mean = measure_mean(tools, tif)
+    g, sig, lut_pct, sat = compute_params(mean, P)
+
+    pre = Path(workdir) / 'pre.tif'
+    # 1) correction primaire : expo (gamma) + noirs/blancs + contraste S
+    cmd = [tools['magick'], str(tif), '-gamma', f'{g:.4f}',
+           '-level', '1%,99.5%', '-sigmoidal-contrast', f'{sig:.2f}x47%']
+    if P.max_size and P.max_size > 0:
+        cmd += ['-resize', f'{P.max_size}x{P.max_size}>']
+    cmd += [str(pre)]
+    _run(cmd)
+
+    src_for_lut = pre
+    if lut and lut_pct > 0:
+        lutimg = Path(workdir) / 'lut.tif'
+        safe = _ffmpeg_lut_path(lut)
+        _run([tools['ffmpeg'], '-nostdin', '-loglevel', 'error', '-y',
+              '-i', str(pre), '-vf', f"lut3d='{safe}'", str(lutimg)])
+        # 2) melange LUT a lut_pct% + reste de l'image corrigee
+        inv = 100 - lut_pct
+        _run([tools['magick'], str(pre), str(lutimg),
+              '-compose', 'blend', '-define', f'compose:args={lut_pct},{inv}',
+              '-composite', '-level', '1.5%,100%',
+              '-modulate', f'100,{sat},100', '-quality', str(P.quality),
+              str(out_jpg)])
+        lutimg.unlink(missing_ok=True)
+    else:
+        # pas de LUT : juste noirs profonds + saturation
+        _run([tools['magick'], str(pre), '-level', '1.5%,100%',
+              '-modulate', f'100,{sat},100', '-quality', str(P.quality),
+              str(out_jpg)])
+    pre.unlink(missing_ok=True)
+    return mean, lut_pct, sat
+
+
+def copy_metadata(tools, raw, jpg):
+    """Recopie EXIF/XMP d'origine mais remet l'orientation a normal."""
+    if not tools.get('exiftool'):
+        return
+    subprocess.run(
+        [tools['exiftool'], '-q', '-overwrite_original', '-TagsFromFile', str(raw),
+         '-EXIF:all', '-XMP:all', '-Orientation#=1', str(jpg)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def process_one(tools, raw, out_dir, lut, P):
+    """Traite une photo RAW de bout en bout. Renvoie (nom, ok, info)."""
+    raw = Path(raw)
+    out_jpg = Path(out_dir) / (raw.stem + '.jpg')
+    workdir = Path(tempfile.mkdtemp(prefix='photosouv-'))
+    configdir = workdir / 'dtcfg'
+    configdir.mkdir(exist_ok=True)
+    try:
+        tif = workdir / (raw.stem + '.tif')
+        if not develop_raw(tools, raw, tif, configdir):
+            return raw.name, False, 'échec développement'
+        mean, lut_pct, sat = grade(tools, tif, out_jpg, lut, P, workdir)
+        copy_metadata(tools, raw, out_jpg)
+        return raw.name, True, f'mean={mean:.3f} LUT={lut_pct}% sat={sat}'
+    except Exception as e:
+        return raw.name, False, str(e)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def scan_folder(folder):
+    """Liste les RAW du dossier, tries par nom (= chronologique en general)."""
+    folder = Path(folder)
+    return sorted([p for p in folder.iterdir()
+                   if p.is_file() and p.suffix.lower() in RAW_EXTS])
+
+
+def process_folder(folder, out_dir, lut, P, tools, workers=3,
+                   log=print, progress=None, should_stop=None):
+    """Traite tout un dossier en parallele. Renvoie (ok, ko)."""
+    raws = scan_folder(folder)
+    if not raws:
+        log("Aucun fichier RAW trouvé dans le dossier.")
+        return 0, 0
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    log(f"{len(raws)} photos RAW à traiter -> {out_dir}")
+    ok = ko = 0
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(process_one, tools, r, out_dir, lut, P): r for r in raws}
+        for fut in as_completed(futs):
+            if should_stop and should_stop():
+                log("Interrompu.")
+                break
+            name, success, info = fut.result()
+            done += 1
+            if success:
+                ok += 1
+                log(f"[{done}/{len(raws)}] {name} -> OK ({info})")
+            else:
+                ko += 1
+                log(f"[{done}/{len(raws)}] {name} -> ÉCHEC ({info})")
+            if progress:
+                progress(int(done * 100 / len(raws)))
+    log(f"Terminé : {ok} OK, {ko} échecs. Sortie : {out_dir}")
+    return ok, ko
+
+
+# --- CLI ---
+
+def run_cli(args):
+    folder = Path(args.folder)
+    if not folder.is_dir():
+        print(f"Erreur: '{folder}' n'est pas un dossier", file=sys.stderr)
+        return 1
+
+    tools = detect_tools()
+    miss = missing_tools(tools)
+    if miss:
+        print(f"Outils manquants: {', '.join(miss)}", file=sys.stderr)
+        print("  sudo dnf install darktable ImageMagick ffmpeg perl-Image-ExifTool",
+              file=sys.stderr)
+        return 1
+
+    style = args.style
+    custom_lut = args.custom_lut
+    if not custom_lut and style in ('neutral', 'portrait'):
+        auto = detect_folder_lut(folder)
+        if auto and args.style == 'neutral':
+            print(f"LUT détectée dans le dossier: {auto} -> style=custom")
+            style, custom_lut = 'custom', auto
+    lut = resolve_style_lut(style, custom_lut)
+    if style not in ('neutral',) and not lut:
+        print(f"Style '{style}': LUT introuvable, fallback neutre.", file=sys.stderr)
+
+    out_dir = args.output or str(folder / 'Retouche_Portra')
+    P = Params(target=args.target, contrast=args.contrast,
+               lut_strength=args.lut_strength, saturation=args.saturation,
+               adaptive=args.adaptive, quality=args.quality, max_size=args.max_size)
+
+    print(f"Style: {style}" + (f" ({Path(lut).name})" if lut else ""))
+    print(f"Adaptatif: {'oui' if P.adaptive else 'non'} | cible={P.target} "
+          f"contraste={P.contrast} LUT={P.lut_strength}% satu={P.saturation} q={P.quality}")
+    ok, ko = process_folder(folder, out_dir, lut, P, tools, workers=args.workers)
+    return 0 if ko == 0 else 2
+
+
+# --- UI ---
+
+def run_ui():
+    try:
+        from PySide6.QtCore import Qt, QThread, Signal
+        from PySide6.QtGui import QFont
+        from PySide6.QtWidgets import (
+            QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+            QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+            QMessageBox, QProgressBar, QPushButton, QSpinBox, QTextEdit,
+            QVBoxLayout, QWidget,
+        )
+    except ImportError:
+        print("PySide6 manque. Installe avec:", file=sys.stderr)
+        print(f"  {sys.executable} -m pip install PySide6", file=sys.stderr)
+        return 1
+
+    class Worker(QThread):
+        log_line = Signal(str)
+        progress_pct = Signal(int)
+        done = Signal(int, int)
+
+        def __init__(self, folder, out_dir, lut, P, tools, workers):
+            super().__init__()
+            self.folder = folder
+            self.out_dir = out_dir
+            self.lut = lut
+            self.P = P
+            self.tools = tools
+            self.workers = workers
+            self._stop = False
+
+        def stop(self):
+            self._stop = True
+
+        def run(self):
+            ok, ko = process_folder(
+                self.folder, self.out_dir, self.lut, self.P, self.tools,
+                workers=self.workers, log=self.log_line.emit,
+                progress=self.progress_pct.emit, should_stop=lambda: self._stop)
+            self.done.emit(ok, ko)
+
+    class MainWindow(QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("Photo Souvenir")
+            self.resize(880, 760)
+            self.tools = detect_tools()
+            self.worker = None
+            self._build_ui()
+            self._check_tools()
+
+        def _build_ui(self):
+            central = QWidget()
+            self.setCentralWidget(central)
+            layout = QVBoxLayout(central)
+
+            header = QLabel(
+                "<h2 style='margin:0'>Photo Souvenir</h2>"
+                "<p style='margin:0;color:#888'>Développe et étalonne tout un lot de "
+                "photos RAW avec un look film, en mode auto adaptatif.</p>")
+            layout.addWidget(header)
+
+            folder_group = QGroupBox("Dossier source (photos RAW)")
+            fl = QHBoxLayout(folder_group)
+            self.folder_edit = QLineEdit()
+            self.folder_edit.setPlaceholderText("Dossier contenant tes .ARW / .CR3 / .NEF ...")
+            self.folder_edit.textChanged.connect(self._update_out_default)
+            browse = QPushButton("Parcourir...")
+            browse.clicked.connect(self.browse_folder)
+            fl.addWidget(self.folder_edit, 1)
+            fl.addWidget(browse)
+            layout.addWidget(folder_group)
+
+            opts = QGroupBox("Look & étalonnage")
+            g = QGridLayout(opts)
+
+            g.addWidget(QLabel("Style (LUT):"), 0, 0)
+            self.style_combo = QComboBox()
+            for _, label in STYLE_LABELS:
+                self.style_combo.addItem(label)
+            self.style_combo.currentIndexChanged.connect(self._on_style_changed)
+            g.addWidget(self.style_combo, 0, 1)
+            self.lut_edit = QLineEdit()
+            self.lut_edit.setPlaceholderText("(custom .cube)")
+            self.lut_edit.setEnabled(False)
+            self.lut_btn = QPushButton("LUT...")
+            self.lut_btn.setEnabled(False)
+            self.lut_btn.clicked.connect(self._browse_lut)
+            g.addWidget(self.lut_edit, 0, 2)
+            g.addWidget(self.lut_btn, 0, 3)
+
+            self.adaptive_check = QCheckBox("Mode adaptatif (atténue LUT/contraste/satu sur les photos claires)")
+            self.adaptive_check.setChecked(True)
+            self.adaptive_check.setToolTip(
+                "Recommandé. Applique le plein effet sur les photos sombres/plates,\n"
+                "et l'atténue sur les photos ensoleillées pour éviter la sursaturation.")
+            g.addWidget(self.adaptive_check, 1, 0, 1, 4)
+
+            g.addWidget(QLabel("Force du LUT:"), 2, 0)
+            self.lut_strength = QSpinBox()
+            self.lut_strength.setRange(0, 100)
+            self.lut_strength.setValue(78)
+            self.lut_strength.setSuffix(" %")
+            self.lut_strength.setToolTip("Dosage du LUT film. 78 = recommandé. Baisse pour un effet plus discret.")
+            g.addWidget(self.lut_strength, 2, 1)
+
+            g.addWidget(QLabel("Contraste:"), 2, 2)
+            self.contrast = QDoubleSpinBox()
+            self.contrast.setRange(0.0, 12.0)
+            self.contrast.setSingleStep(0.5)
+            self.contrast.setValue(6.0)
+            self.contrast.setToolTip("Force de la courbe S. 6 = punchy (défaut), 3 = doux, 9 = dramatique.")
+            g.addWidget(self.contrast, 2, 3)
+
+            g.addWidget(QLabel("Cible d'expo:"), 3, 0)
+            self.target = QDoubleSpinBox()
+            self.target.setRange(0.20, 0.60)
+            self.target.setSingleStep(0.01)
+            self.target.setValue(0.38)
+            self.target.setToolTip("Luminosité moyenne visée. 0.38 = recommandé. Monte pour plus clair.")
+            g.addWidget(self.target, 3, 1)
+
+            g.addWidget(QLabel("Saturation:"), 3, 2)
+            self.saturation = QSpinBox()
+            self.saturation.setRange(50, 150)
+            self.saturation.setValue(100)
+            self.saturation.setSuffix(" %")
+            g.addWidget(self.saturation, 3, 3)
+
+            g.addWidget(QLabel("Qualité JPEG:"), 4, 0)
+            self.quality = QSpinBox()
+            self.quality.setRange(70, 100)
+            self.quality.setValue(92)
+            g.addWidget(self.quality, 4, 1)
+
+            g.addWidget(QLabel("Côté max (px):"), 4, 2)
+            self.maxsize = QSpinBox()
+            self.maxsize.setRange(0, 12000)
+            self.maxsize.setValue(0)
+            self.maxsize.setSpecialValueText("Pleine résolution")
+            self.maxsize.setSingleStep(500)
+            g.addWidget(self.maxsize, 4, 3)
+
+            g.addWidget(QLabel("Threads:"), 5, 0)
+            self.workers = QSpinBox()
+            self.workers.setRange(1, 16)
+            self.workers.setValue(max(1, min(4, (os.cpu_count() or 4) // 2)))
+            self.workers.setToolTip("Nombre de photos traitées en parallèle.")
+            g.addWidget(self.workers, 5, 1)
+
+            g.addWidget(QLabel("Sortie:"), 5, 2)
+            self.out_edit = QLineEdit()
+            self.out_edit.setPlaceholderText("(sous-dossier Retouche_Portra)")
+            g.addWidget(self.out_edit, 5, 3)
+
+            layout.addWidget(opts)
+
+            btn_row = QHBoxLayout()
+            self.launch_btn = QPushButton("Lancer le traitement")
+            self.launch_btn.setMinimumHeight(46)
+            f = QFont(); f.setBold(True); f.setPointSize(11)
+            self.launch_btn.setFont(f)
+            self.launch_btn.clicked.connect(self.launch)
+            btn_row.addWidget(self.launch_btn, 2)
+            self.stop_btn = QPushButton("Stop")
+            self.stop_btn.setMinimumHeight(46)
+            self.stop_btn.setEnabled(False)
+            self.stop_btn.clicked.connect(self.stop)
+            btn_row.addWidget(self.stop_btn, 1)
+            layout.addLayout(btn_row)
+
+            self.progress = QProgressBar()
+            self.progress.setVisible(False)
+            layout.addWidget(self.progress)
+
+            log_group = QGroupBox("Log")
+            ll = QVBoxLayout(log_group)
+            self.log = QTextEdit()
+            self.log.setReadOnly(True)
+            self.log.setFont(QFont("monospace", 9))
+            ll.addWidget(self.log)
+            layout.addWidget(log_group, 1)
+
+        def _check_tools(self):
+            miss = missing_tools(self.tools)
+            if miss:
+                self.log.append(
+                    "ATTENTION outils manquants: " + ", ".join(miss) +
+                    "\n  sudo dnf install darktable ImageMagick ffmpeg perl-Image-ExifTool")
+            if not self.tools.get('exiftool'):
+                self.log.append("Note: exiftool absent -> métadonnées/orientation non recopiées.")
+
+        def _on_style_changed(self, idx):
+            key = STYLE_LABELS[idx][0]
+            is_custom = (key == 'custom')
+            self.lut_edit.setEnabled(is_custom)
+            self.lut_btn.setEnabled(is_custom)
+
+        def _browse_lut(self):
+            path, _ = QFileDialog.getOpenFileName(self, "Choisir un .cube", "", "LUT (*.cube)")
+            if path:
+                self.lut_edit.setText(path)
+
+        def browse_folder(self):
+            d = QFileDialog.getExistingDirectory(self, "Dossier source")
+            if d:
+                self.folder_edit.setText(d)
+
+        def _update_out_default(self, text):
+            if text.strip():
+                self.out_edit.setPlaceholderText(str(Path(text.strip()) / 'Retouche_Portra'))
+
+        def _gather(self):
+            key = STYLE_LABELS[self.style_combo.currentIndex()][0]
+            custom = self.lut_edit.text().strip() or None
+            lut = resolve_style_lut(key, custom)
+            P = Params(
+                target=self.target.value(), contrast=self.contrast.value(),
+                lut_strength=self.lut_strength.value(), saturation=self.saturation.value(),
+                adaptive=self.adaptive_check.isChecked(), quality=self.quality.value(),
+                max_size=self.maxsize.value())
+            return key, lut, P
+
+        def launch(self):
+            folder = self.folder_edit.text().strip()
+            if not folder or not Path(folder).is_dir():
+                QMessageBox.warning(self, "Photo Souvenir", "Sélectionne un dossier source valide.")
+                return
+            miss = missing_tools(self.tools)
+            if miss:
+                QMessageBox.critical(self, "Photo Souvenir",
+                                     "Outils manquants: " + ", ".join(miss))
+                return
+            key, lut, P = self._gather()
+            if key not in ('neutral',) and not lut:
+                QMessageBox.warning(self, "Photo Souvenir", "LUT introuvable pour ce style.")
+                return
+            out_dir = self.out_edit.text().strip() or str(Path(folder) / 'Retouche_Portra')
+            self.log.clear()
+            self.log.append(f"Style: {key}" + (f" ({Path(lut).name})" if lut else ""))
+            self.progress.setVisible(True)
+            self.progress.setValue(0)
+            self.launch_btn.setEnabled(False)
+            self.stop_btn.setEnabled(True)
+            self.worker = Worker(folder, out_dir, lut, P, self.tools, self.workers.value())
+            self.worker.log_line.connect(self.log.append)
+            self.worker.progress_pct.connect(self.progress.setValue)
+            self.worker.done.connect(self._on_done)
+            self.worker.start()
+
+        def stop(self):
+            if self.worker:
+                self.worker.stop()
+                self.stop_btn.setEnabled(False)
+
+        def _on_done(self, ok, ko):
+            self.launch_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.progress.setValue(100)
+            QMessageBox.information(self, "Photo Souvenir",
+                                    f"Terminé : {ok} photos traitées, {ko} échecs.")
+
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    return app.exec()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Developpe et etalonne un lot de photos RAW avec un look film.")
+    parser.add_argument('folder', nargs='?', help="Dossier source. Si omis, ouvre l'UI.")
+    parser.add_argument('output', nargs='?', help="Dossier de sortie (defaut: <source>/Retouche_Portra).")
+    parser.add_argument('--style', default='portrait',
+                        choices=[k for k, _ in STYLE_LABELS],
+                        help="Look film applique (defaut: portrait/Portra).")
+    parser.add_argument('--lut', dest='custom_lut', default=None,
+                        help="Chemin vers un .cube (force style=custom).")
+    parser.add_argument('--no-adaptive', dest='adaptive', action='store_false', default=True,
+                        help="Desactive l'attenuation auto sur les photos claires.")
+    parser.add_argument('--target', type=float, default=0.38,
+                        help="Cible d'exposition (luminance moyenne, defaut 0.38).")
+    parser.add_argument('--contrast', type=float, default=6.0,
+                        help="Force de la courbe S (defaut 6).")
+    parser.add_argument('--lut-strength', dest='lut_strength', type=int, default=78,
+                        help="Dosage du LUT en %% (defaut 78).")
+    parser.add_argument('--saturation', type=int, default=100,
+                        help="Saturation finale en %% (defaut 100).")
+    parser.add_argument('--quality', type=int, default=92,
+                        help="Qualite JPEG (defaut 92).")
+    parser.add_argument('--max-size', dest='max_size', type=int, default=0,
+                        help="Cote max en px (0 = pleine resolution).")
+    parser.add_argument('--workers', type=int, default=max(1, min(4, (os.cpu_count() or 4) // 2)),
+                        help="Photos traitees en parallele.")
+    args = parser.parse_args()
+
+    if not args.folder:
+        return run_ui()
+    return run_cli(args)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

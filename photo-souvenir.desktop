@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Photo Souvenir
+GenericName=Etalonnage photo par lot
+Comment=Developpe et etalonne un lot de photos RAW avec un look film
+Exec=/home/goss/.local/bin/photo-souvenir
+Icon=photo-souvenir
+Terminal=false
+Categories=Graphics;Photography;Qt;
+StartupNotify=true
+StartupWMClass=Photo Souvenir
+Keywords=photo;raw;arw;darktable;lut;film;portra;etalonnage;batch;souvenir;
