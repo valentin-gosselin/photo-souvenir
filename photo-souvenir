@@ -175,18 +175,25 @@ def _run(cmd):
                           stderr=subprocess.DEVNULL).returncode
 
 
-def dt_style_available(name):
-    """Verifie qu'un style darktable existe dans la base de l'utilisateur."""
-    if not name or not DT_USER_DATA.is_file():
-        return False
+def list_dt_styles():
+    """Liste les styles darktable de l'utilisateur (hors styles camera _l10n)."""
+    if not DT_USER_DATA.is_file():
+        return []
     try:
         import sqlite3 as _sq
         con = _sq.connect(f'file:{DT_USER_DATA}?mode=ro', uri=True)
-        n = con.execute("SELECT count(*) FROM styles WHERE name=?", (name,)).fetchone()[0]
+        rows = con.execute(
+            "SELECT name FROM styles WHERE name NOT LIKE '\\_l10n%' ESCAPE '\\' "
+            "ORDER BY name COLLATE NOCASE").fetchall()
         con.close()
-        return n > 0
+        return [r[0] for r in rows]
     except Exception:
-        return False
+        return []
+
+
+def dt_style_available(name):
+    """Verifie qu'un style darktable existe dans la base de l'utilisateur."""
+    return bool(name) and name in list_dt_styles()
 
 
 def develop_raw(tools, raw, tif, configdir, dt_style=None):
@@ -482,6 +489,19 @@ def run_ui():
         print(f"  {sys.executable} -m pip install PySide6", file=sys.stderr)
         return 1
 
+    class StyleCombo(QComboBox):
+        """Combo des styles darktable, rafraichi a chaque ouverture du menu."""
+        def showPopup(self):
+            current = self.currentText()
+            self.blockSignals(True)
+            self.clear()
+            self.addItem("(aucun)")
+            self.addItems(list_dt_styles())
+            idx = self.findText(current)
+            self.setCurrentIndex(idx if idx >= 0 else 0)
+            self.blockSignals(False)
+            super().showPopup()
+
     class Worker(QThread):
         log_line = Signal(str)
         progress_pct = Signal(int)
@@ -639,13 +659,14 @@ def run_ui():
             g.addWidget(self.denoise_str, 6, 1)
 
             g.addWidget(QLabel("Style darktable:"), 6, 2)
-            self.dt_style_edit = QLineEdit()
-            self.dt_style_edit.setPlaceholderText("(ex. style raw denoise, optionnel)")
-            self.dt_style_edit.setToolTip(
-                "Nom d'un style darktable appliqué au développement (en plus du pipeline\n"
-                "par défaut), typiquement un style 'Réduction du bruit (RAW)'. Se combine\n"
-                "avec le débruitage post. Le style doit exister dans ta base darktable.")
-            g.addWidget(self.dt_style_edit, 6, 3)
+            self.dt_style_combo = StyleCombo()
+            self.dt_style_combo.addItem("(aucun)")
+            self.dt_style_combo.addItems(list_dt_styles())
+            self.dt_style_combo.setToolTip(
+                "Style darktable appliqué au développement (en plus du pipeline par\n"
+                "défaut), typiquement un style 'Réduction du bruit (RAW)/(profilé)'.\n"
+                "Se combine avec le débruitage post. Liste lue depuis ta base darktable.")
+            g.addWidget(self.dt_style_combo, 6, 3)
 
             g.addWidget(QLabel("Threads:"), 7, 0)
             self.workers = QSpinBox()
@@ -728,7 +749,8 @@ def run_ui():
                 max_size=self.maxsize.value(), denoise=denoise,
                 noise_threshold=self.noise_thr.value(),
                 denoise_strength=self.denoise_str.value(),
-                dt_style=(self.dt_style_edit.text().strip() or None))
+                dt_style=(self.dt_style_combo.currentText()
+                          if self.dt_style_combo.currentIndex() > 0 else None))
             return key, lut, P
 
         def launch(self):
