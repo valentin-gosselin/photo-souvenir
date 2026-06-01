@@ -72,6 +72,17 @@ ok "$APP_DIR/photo-souvenir.desktop"
 cp -f photo-souvenir.svg "$ICON_DIR/photo-souvenir.svg"
 ok "$ICON_DIR/photo-souvenir.svg"
 
+# PNG multi-tailles (KDE/Plasma resout plus fiablement le PNG que le SVG seul)
+MAGICK="$(command -v magick || command -v convert || true)"
+if [[ -n "$MAGICK" ]]; then
+  for sz in 32 48 64 128 256; do
+    d="$HOME/.local/share/icons/hicolor/${sz}x${sz}/apps"
+    mkdir -p "$d"
+    "$MAGICK" -background none photo-souvenir.svg -resize ${sz}x${sz} "$d/photo-souvenir.png" 2>/dev/null
+  done
+  ok "icones PNG 32->256 generees"
+fi
+
 # --- Install LUTs ---
 LUT_DIR="$HOME/.local/share/photo-souvenir/luts"
 mkdir -p "$LUT_DIR"
@@ -80,8 +91,10 @@ if [[ -d luts ]]; then
     ok "$(ls $LUT_DIR/*.cube 2>/dev/null | wc -l) LUTs installees dans $LUT_DIR"
 fi
 
-# --- Refresh menu KDE/GNOME ---
-command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 >/dev/null 2>&1 || true
+# --- Refresh menu + caches d'icones KDE/GNOME ---
+rm -f "$HOME/.cache/icon-cache.kcache" 2>/dev/null || true
+command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
+command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
 command -v update-desktop-database >/dev/null && update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
 
 if ! echo ":$PATH:" | grep -q ":$BIN_DIR:"; then
