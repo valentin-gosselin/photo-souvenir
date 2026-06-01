@@ -126,7 +126,7 @@ class Params:
     """Reglages d'etalonnage exposes a l'UI/CLI."""
     def __init__(self, target=0.38, contrast=6.0, lut_strength=78,
                  saturation=100, adaptive=True, quality=92, max_size=0,
-                 denoise='off', noise_threshold=1.5):
+                 denoise='off', noise_threshold=1.5, denoise_strength=1.0):
         self.target = target          # cible d'exposition (luminance moyenne 0..1)
         self.contrast = contrast      # force courbe S (sigmoidal) sur sombres/moyennes
         self.lut_strength = lut_strength  # % du LUT applique (sombres/moyennes)
@@ -136,6 +136,7 @@ class Params:
         self.max_size = max_size      # cote max en px (0 = pleine resolution)
         self.denoise = denoise        # 'off' | 'auto' | 'always'
         self.noise_threshold = noise_threshold  # sigma au-dela duquel on debruite (mode auto)
+        self.denoise_strength = denoise_strength  # multiplicateur de force (1.0 = defaut)
 
 
 def compute_params(mean, P):
@@ -234,28 +235,29 @@ def _iso_noise_fallback(tools, raw):
     return round(0.4 + 0.0009 * max(0, iso - 200), 2)
 
 
-def denoise_tif(tools, in_tif, out_tif, sigma):
-    """Debruitage chroma-focus adaptatif (garde un grain de luminance).
+def denoise_tif(tools, in_tif, out_tif, sigma, strength=1.0):
+    """Debruitage adaptatif dose selon sigma (et un multiplicateur de force).
 
-    Mediane sur les canaux chroma (a&b du LAB) -> tue les points colores,
-    + debruitage luma leger via hqdn3d, dose selon sigma. Sortie forcee en
-    sRGB (ffmpeg ecrit du YCbCr sinon -> derive magenta).
+    1) mediane sur les canaux chroma (a&b du LAB) -> tue les points colores ;
+    2) nlmeans sur la luminance -> enleve le grain (meilleur que hqdn3d, plus
+       lent). Force et fenetres mises a l'echelle de sigma * strength. Sortie
+       forcee en sRGB (ffmpeg ecrit du YCbCr sinon -> derive magenta).
     """
-    cw = int(max(3, min(11, round(sigma * 1.6) | 1)))     # fenetre chroma impaire 3..11
+    cw = int(max(3, min(13, round(sigma * 1.6 * strength) | 1)))   # fenetre chroma impaire
     tmp = Path(out_tif).with_suffix('.chroma.tif')
     _run([tools['magick'], str(in_tif), '-colorspace', 'LAB',
           '-channel', 'GB', '-statistic', 'median', f'{cw}x{cw}',
           '+channel', '-colorspace', 'sRGB', str(tmp)])
-    ls = int(max(0, min(8, round(sigma * 1.5))))           # luma 0..8
-    if ls > 0:
-        rc = _run([tools['ffmpeg'], '-nostdin', '-loglevel', 'error', '-y',
-                   '-i', str(tmp), '-vf', f'hqdn3d={ls}:0:0:0',
-                   '-pix_fmt', 'rgb24', str(out_tif)])
-        tmp.unlink(missing_ok=True)
-        if rc == 0 and Path(out_tif).is_file():
-            return cw, ls
-    # pas de luma denoise (ou echec ffmpeg) : on garde la version chroma
-    shutil.move(str(tmp), str(out_tif))
+    nl = int(max(2, min(22, round(sigma * 1.8 * strength))))       # force nlmeans
+    rc = _run([tools['ffmpeg'], '-nostdin', '-loglevel', 'error', '-y',
+               '-i', str(tmp), '-vf', f'nlmeans=s={nl}:p=7:r=15',
+               '-pix_fmt', 'rgb24', str(out_tif)])
+    tmp.unlink(missing_ok=True)
+    if rc == 0 and Path(out_tif).is_file():
+        return cw, nl
+    # echec nlmeans : on garde au moins la version chroma
+    if tmp.is_file():
+        shutil.move(str(tmp), str(out_tif))
     return cw, 0
 
 
@@ -328,11 +330,11 @@ def process_one(tools, raw, out_dir, lut, P):
                 apply = (P.denoise == 'always') or (sigma >= P.noise_threshold)
                 if apply:
                     dn = workdir / (raw.stem + '_dn.tif')
-                    cw, ls = denoise_tif(tools, tif, dn, sigma)
+                    cw, nl = denoise_tif(tools, tif, dn, sigma, P.denoise_strength)
                     if dn.is_file():
                         tif.unlink(missing_ok=True)
                         tif = dn
-                    dn_info = f' bruit σ={sigma:.1f}->débruité(chroma {cw}px,luma {ls})'
+                    dn_info = f' bruit σ={sigma:.1f}->débruité(chroma {cw}px,nlmeans {nl})'
                 else:
                     dn_info = f' bruit σ={sigma:.1f} (sous seuil)'
 
@@ -414,7 +416,8 @@ def run_cli(args):
     P = Params(target=args.target, contrast=args.contrast,
                lut_strength=args.lut_strength, saturation=args.saturation,
                adaptive=args.adaptive, quality=args.quality, max_size=args.max_size,
-               denoise=args.denoise, noise_threshold=args.noise_threshold)
+               denoise=args.denoise, noise_threshold=args.noise_threshold,
+               denoise_strength=args.denoise_strength)
 
     print(f"Style: {style}" + (f" ({Path(lut).name})" if lut else ""))
     print(f"Adaptatif: {'oui' if P.adaptive else 'non'} | cible={P.target} "
@@ -589,17 +592,27 @@ def run_ui():
                 "Repères : ISO 200 ~ 0.4, ISO 8000 ~ 2.1, ISO 51200 ~ 3.8.")
             g.addWidget(self.noise_thr, 5, 3)
 
-            g.addWidget(QLabel("Threads:"), 6, 0)
+            g.addWidget(QLabel("Force débruitage:"), 6, 0)
+            self.denoise_str = QDoubleSpinBox()
+            self.denoise_str.setRange(0.3, 2.0)
+            self.denoise_str.setSingleStep(0.1)
+            self.denoise_str.setValue(1.0)
+            self.denoise_str.setToolTip(
+                "Force du débruitage (nlmeans, lent). 0.6 = doux (garde du grain),\n"
+                "1.0 = standard, 1.5 = agressif (très lisse, léger effet peinture).")
+            g.addWidget(self.denoise_str, 6, 1)
+
+            g.addWidget(QLabel("Threads:"), 7, 0)
             self.workers = QSpinBox()
             self.workers.setRange(1, 16)
             self.workers.setValue(max(1, min(4, (os.cpu_count() or 4) // 2)))
             self.workers.setToolTip("Nombre de photos traitées en parallèle.")
-            g.addWidget(self.workers, 6, 1)
+            g.addWidget(self.workers, 7, 1)
 
-            g.addWidget(QLabel("Sortie:"), 6, 2)
+            g.addWidget(QLabel("Sortie:"), 7, 2)
             self.out_edit = QLineEdit()
             self.out_edit.setPlaceholderText("(sous-dossier Retouche_Portra)")
-            g.addWidget(self.out_edit, 6, 3)
+            g.addWidget(self.out_edit, 7, 3)
 
             layout.addWidget(opts)
 
@@ -668,7 +681,8 @@ def run_ui():
                 lut_strength=self.lut_strength.value(), saturation=self.saturation.value(),
                 adaptive=self.adaptive_check.isChecked(), quality=self.quality.value(),
                 max_size=self.maxsize.value(), denoise=denoise,
-                noise_threshold=self.noise_thr.value())
+                noise_threshold=self.noise_thr.value(),
+                denoise_strength=self.denoise_str.value())
             return key, lut, P
 
         def launch(self):
@@ -746,6 +760,9 @@ def main():
     parser.add_argument('--noise-threshold', dest='noise_threshold', type=float, default=1.5,
                         help="Seuil de bruit (sigma) en mode auto (defaut 1.5). "
                              "Repere : ISO200~0.4, ISO8000~2.1, ISO51200~3.8.")
+    parser.add_argument('--denoise-strength', dest='denoise_strength', type=float, default=1.0,
+                        help="Force du debruitage (defaut 1.0). 0.6 = doux/garde du grain, "
+                             "1.5 = agressif/tres lisse. Utilise nlmeans (lent).")
     parser.add_argument('--workers', type=int, default=max(1, min(4, (os.cpu_count() or 4) // 2)),
                         help="Photos traitees en parallele.")
     args = parser.parse_args()
