@@ -62,7 +62,19 @@ photo-souvenir "/dossier" /sortie --lut /chemin/look.cube --no-adaptive --qualit
 
 # debruite seulement les photos tres bruitees (ISO eleve)
 photo-souvenir "/dossier" --denoise auto --noise-threshold 1.5
+
+# combine un style darktable (raw denoise / profile) au develop + notre debruitage post
+photo-souvenir "/dossier" --denoise auto --dt-style Doux
 ```
+
+### Style darktable (raw denoise / profilé)
+
+Pour la meilleure qualité sur les photos très bruitées, on peut appliquer un **style darktable** au développement (avant dématriçage), combiné au débruitage post. C'est le vrai *Réduction du bruit (RAW)* et/ou *Réduction du bruit (profilé)* de darktable, réglés à ton goût.
+
+1. Dans darktable, édite une photo, active le(s) module(s) de débruitage, puis **crée un style** (lighttable → module Styles → créer) en ne cochant que ces modules. Nomme-le, ex. `Doux`.
+2. Passe `--dt-style Doux` (ou renseigne le champ *Style darktable* dans l'UI). Le nom doit être **exact** (sensible à la casse).
+
+Le style est appliqué **par-dessus** le pipeline par défaut, dans des configs isolées (parallélisme préservé). Le détecteur de grain mesure ensuite le bruit *restant* et adapte le débruitage post : darktable pré-nettoie, notre passe complète — sans sur-lisser.
 
 Options principales : `--style` (portrait/cinema-kodak/cinema-fuji/vintage/chrome/bw/neutral/custom), `--lut`, `--no-adaptive`, `--target`, `--contrast`, `--lut-strength`, `--saturation`, `--quality`, `--max-size`, `--denoise` (off/auto/always), `--noise-threshold`, `--workers`.
 

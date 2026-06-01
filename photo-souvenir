@@ -33,6 +33,9 @@ from pathlib import Path
 
 RAW_EXTS = {'.arw', '.cr2', '.cr3', '.nef', '.raf', '.dng', '.orf', '.rw2', '.pef', '.srw'}
 
+# Base darktable de l'utilisateur (contient les styles crees dans le GUI)
+DT_USER_DATA = Path.home() / '.config' / 'darktable' / 'data.db'
+
 # Repertoires ou chercher les LUTs bundlees (par ordre de priorite)
 LUT_DIRS = [
     Path.home() / '.local' / 'share' / 'photo-souvenir' / 'luts',
@@ -126,7 +129,8 @@ class Params:
     """Reglages d'etalonnage exposes a l'UI/CLI."""
     def __init__(self, target=0.38, contrast=6.0, lut_strength=78,
                  saturation=100, adaptive=True, quality=92, max_size=0,
-                 denoise='off', noise_threshold=1.5, denoise_strength=1.0):
+                 denoise='off', noise_threshold=1.5, denoise_strength=1.0,
+                 dt_style=None):
         self.target = target          # cible d'exposition (luminance moyenne 0..1)
         self.contrast = contrast      # force courbe S (sigmoidal) sur sombres/moyennes
         self.lut_strength = lut_strength  # % du LUT applique (sombres/moyennes)
@@ -137,6 +141,7 @@ class Params:
         self.denoise = denoise        # 'off' | 'auto' | 'always'
         self.noise_threshold = noise_threshold  # sigma au-dela duquel on debruite (mode auto)
         self.denoise_strength = denoise_strength  # multiplicateur de force (1.0 = defaut)
+        self.dt_style = dt_style      # nom d'un style darktable a appliquer au develop (ex. raw denoise)
 
 
 def compute_params(mean, P):
@@ -170,11 +175,36 @@ def _run(cmd):
                           stderr=subprocess.DEVNULL).returncode
 
 
-def develop_raw(tools, raw, tif, configdir):
-    """RAW -> TIFF 16-bit via darktable-cli (orientation appliquee)."""
-    cmd = [tools['darktable-cli'], str(raw), str(tif),
-           '--hq', 'true', '--core', '--library', ':memory:',
-           '--configdir', str(configdir)]
+def dt_style_available(name):
+    """Verifie qu'un style darktable existe dans la base de l'utilisateur."""
+    if not name or not DT_USER_DATA.is_file():
+        return False
+    try:
+        import sqlite3 as _sq
+        con = _sq.connect(f'file:{DT_USER_DATA}?mode=ro', uri=True)
+        n = con.execute("SELECT count(*) FROM styles WHERE name=?", (name,)).fetchone()[0]
+        con.close()
+        return n > 0
+    except Exception:
+        return False
+
+
+def develop_raw(tools, raw, tif, configdir, dt_style=None):
+    """RAW -> TIFF 16-bit via darktable-cli (orientation appliquee).
+
+    Si dt_style est fourni, on copie la base darktable de l'utilisateur dans le
+    configdir isole (pour y trouver le style) et on applique le style PAR-DESSUS
+    le pipeline par defaut (sans --style-overwrite -> on garde demosaic, WB,
+    sigmoid, etc., et on ajoute le module du style, ex. rawdenoise).
+    """
+    cmd = [tools['darktable-cli'], str(raw), str(tif), '--hq', 'true']
+    if dt_style and DT_USER_DATA.is_file():
+        try:
+            shutil.copy2(DT_USER_DATA, Path(configdir) / 'data.db')
+            cmd += ['--style', dt_style]
+        except Exception:
+            pass
+    cmd += ['--core', '--library', ':memory:', '--configdir', str(configdir)]
     _run(cmd)
     return Path(tif).is_file()
 
@@ -317,7 +347,7 @@ def process_one(tools, raw, out_dir, lut, P):
     configdir.mkdir(exist_ok=True)
     try:
         tif = workdir / (raw.stem + '.tif')
-        if not develop_raw(tools, raw, tif, configdir):
+        if not develop_raw(tools, raw, tif, configdir, P.dt_style):
             return raw.name, False, 'échec développement'
 
         # detection du grain + debruitage adaptatif (avant l'eclaircissement)
@@ -362,6 +392,12 @@ def process_folder(folder, out_dir, lut, P, tools, workers=3,
         log("Aucun fichier RAW trouvé dans le dossier.")
         return 0, 0
     Path(out_dir).mkdir(parents=True, exist_ok=True)
+    if P.dt_style:
+        if dt_style_available(P.dt_style):
+            log(f"Style darktable appliqué au développement : '{P.dt_style}'")
+        else:
+            log(f"ATTENTION : style darktable '{P.dt_style}' introuvable -> ignoré.")
+            P.dt_style = None
     log(f"{len(raws)} photos RAW à traiter -> {out_dir}")
     ok = ko = 0
     done = 0
@@ -417,7 +453,7 @@ def run_cli(args):
                lut_strength=args.lut_strength, saturation=args.saturation,
                adaptive=args.adaptive, quality=args.quality, max_size=args.max_size,
                denoise=args.denoise, noise_threshold=args.noise_threshold,
-               denoise_strength=args.denoise_strength)
+               denoise_strength=args.denoise_strength, dt_style=args.dt_style)
 
     print(f"Style: {style}" + (f" ({Path(lut).name})" if lut else ""))
     print(f"Adaptatif: {'oui' if P.adaptive else 'non'} | cible={P.target} "
@@ -602,6 +638,15 @@ def run_ui():
                 "1.0 = standard, 1.5 = agressif (très lisse, léger effet peinture).")
             g.addWidget(self.denoise_str, 6, 1)
 
+            g.addWidget(QLabel("Style darktable:"), 6, 2)
+            self.dt_style_edit = QLineEdit()
+            self.dt_style_edit.setPlaceholderText("(ex. style raw denoise, optionnel)")
+            self.dt_style_edit.setToolTip(
+                "Nom d'un style darktable appliqué au développement (en plus du pipeline\n"
+                "par défaut), typiquement un style 'Réduction du bruit (RAW)'. Se combine\n"
+                "avec le débruitage post. Le style doit exister dans ta base darktable.")
+            g.addWidget(self.dt_style_edit, 6, 3)
+
             g.addWidget(QLabel("Threads:"), 7, 0)
             self.workers = QSpinBox()
             self.workers.setRange(1, 16)
@@ -682,7 +727,8 @@ def run_ui():
                 adaptive=self.adaptive_check.isChecked(), quality=self.quality.value(),
                 max_size=self.maxsize.value(), denoise=denoise,
                 noise_threshold=self.noise_thr.value(),
-                denoise_strength=self.denoise_str.value())
+                denoise_strength=self.denoise_str.value(),
+                dt_style=(self.dt_style_edit.text().strip() or None))
             return key, lut, P
 
         def launch(self):
@@ -763,6 +809,10 @@ def main():
     parser.add_argument('--denoise-strength', dest='denoise_strength', type=float, default=1.0,
                         help="Force du debruitage (defaut 1.0). 0.6 = doux/garde du grain, "
                              "1.5 = agressif/tres lisse. Utilise nlmeans (lent).")
+    parser.add_argument('--dt-style', dest='dt_style', default=None,
+                        help="Nom d'un style darktable a appliquer au developpement (ex. un "
+                             "style 'raw denoise'). Combine avec le debruitage post. Le style "
+                             "doit exister dans ta base darktable (~/.config/darktable).")
     parser.add_argument('--workers', type=int, default=max(1, min(4, (os.cpu_count() or 4) // 2)),
                         help="Photos traitees en parallele.")
     args = parser.parse_args()
